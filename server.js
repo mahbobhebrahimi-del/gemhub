@@ -1,77 +1,246 @@
 const http = require('http');
-const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'change-this-password';
-const SITE = path.join(__dirname, 'index.html');
-const ORDERS_FILE = path.join(__dirname, 'orders.json');
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
-function sendTelegram(text){
-  if(!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return Promise.resolve();
-  return new Promise((resolve)=>{
-    const data=JSON.stringify({chat_id:TELEGRAM_CHAT_ID,text,parse_mode:'HTML'});
-    const req=https.request({hostname:'api.telegram.org',path:`/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,method:'POST',headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(data)}},r=>{r.on('data',()=>{});r.on('end',resolve)});
-    req.on('error',resolve);
-    req.write(data);req.end();
+const ROOT = __dirname;
+const SITE = path.join(ROOT, 'index.html');
+const DATA_DIR = path.join(ROOT, 'data');
+const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
+const PRODUCTS_FILE = path.join(DATA_DIR, 'products.json');
+const COUPONS_FILE = path.join(DATA_DIR, 'coupons.json');
+const TOPUPS_FILE = path.join(DATA_DIR, 'wallet-topups.json');
+
+const DEFAULT_PRODUCTS = [
+  {id:'g100',name:'100 جم + 10 جم',price:166516,type:'gem',art:'diamond',bulkPercent:0},
+  {id:'g200',name:'200 جم',price:293032,type:'gem',art:'diamond2',bulkPercent:1},
+  {id:'g310',name:'310 جم',price:453610,type:'gem',art:'crate',bulkPercent:2},
+  {id:'g520',name:'520 جم',price:745570,type:'gem',art:'crate2',badge:'پرفروش',bulkPercent:3},
+  {id:'g1060',name:'1060 جم',price:1451140,type:'gem',art:'crate3',bulkPercent:5},
+  {id:'g2180',name:'2180 جم',price:2716300,type:'gem',art:'mega',bulkPercent:7},
+  {id:'g5600',name:'5600 جم',price:5392600,type:'gem',art:'mega',sold:true,bulkPercent:7},
+  {id:'w',name:'کارت هفتگی',price:260000,type:'account',art:'weekly'},
+  {id:'wl',name:'کارت هفتگی لایت',price:70000,type:'account',art:'weekly'},
+  {id:'m',name:'کارت ماهانه',price:1600000,type:'account',art:'monthly'},
+  {id:'o1',name:'افر 1 دلاری',price:140000,type:'account',art:'offer'},
+  {id:'o2',name:'افر 2 دلاری',price:280000,type:'account',art:'offer'},
+  {id:'o3',name:'افر 3 دلاری',price:420000,type:'account',art:'offer'},
+  {id:'l6',name:'لول آپ 6',price:60000,type:'account',art:'level'},
+  {id:'l10',name:'لول آپ 10',price:100000,type:'account',art:'level'},
+  {id:'l15',name:'لول آپ 15',price:100000,type:'account',art:'level'},
+  {id:'l20',name:'لول آپ 20',price:100000,type:'account',art:'level'},
+  {id:'l25',name:'لول آپ 25',price:100000,type:'account',art:'level'},
+  {id:'l30',name:'لول آپ 30',price:150000,type:'account',art:'level'},
+  {id:'lf',name:'لول آپ کامل',price:650000,type:'account',art:'level',badge:'کامل'}
+];
+
+function ensureFile(file, fallback) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(file)) fs.writeFileSync(file, JSON.stringify(fallback, null, 2), 'utf8');
+}
+
+ensureFile(ORDERS_FILE, []);
+ensureFile(PRODUCTS_FILE, DEFAULT_PRODUCTS);
+ensureFile(COUPONS_FILE, []);
+ensureFile(TOPUPS_FILE, []);
+
+function readJson(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (_) { return fallback; }
+}
+
+function writeJson(file, data) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
+}
+
+function json(res, status, data) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store'
+  });
+  res.end(JSON.stringify(data));
+}
+
+function html(res, status, body) {
+  res.writeHead(status, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store'
+  });
+  res.end(body);
+}
+
+function text(res, status, body) {
+  res.writeHead(status, {'Content-Type': 'text/plain; charset=utf-8'});
+  res.end(body);
+}
+
+function parseBody(req) {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    req.on('data', chunk => {
+      raw += chunk;
+      if (raw.length > 20 * 1024 * 1024) {
+        reject(new Error('Request too large'));
+        req.destroy();
+      }
+    });
+    req.on('end', () => {
+      if (!raw) return resolve({});
+      try { resolve(JSON.parse(raw)); }
+      catch (_) { reject(new Error('Invalid JSON')); }
+    });
+    req.on('error', reject);
   });
 }
 
-function loadOrders(){
-  try { return JSON.parse(fs.readFileSync(ORDERS_FILE,'utf8')); }
-  catch { return []; }
-}
-function saveOrders(orders){ fs.writeFileSync(ORDERS_FILE, JSON.stringify(orders,null,2), 'utf8'); }
-function json(res,status,data){ res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'}); res.end(JSON.stringify(data)); }
-function parseBody(req){return new Promise((resolve,reject)=>{let raw='';req.on('data',c=>{raw+=c;if(raw.length>1e6)req.destroy()});req.on('end',()=>{try{resolve(JSON.parse(raw||'{}'))}catch(e){reject(e)}});req.on('error',reject)})}
-function auth(req,res){
-  const h=req.headers.authorization||'';
-  if(!h.startsWith('Basic ')){res.writeHead(401,{'WWW-Authenticate':'Basic realm="Gem Hub Admin"'});res.end('Authentication required');return false}
-  const decoded=Buffer.from(h.slice(6),'base64').toString();
-  const i=decoded.indexOf(':');
-  const u=decoded.slice(0,i), p=decoded.slice(i+1);
-  if(u!==ADMIN_USER||p!==ADMIN_PASSWORD){res.writeHead(401,{'WWW-Authenticate':'Basic realm="Gem Hub Admin"'});res.end('Invalid credentials');return false}
+function auth(req, res) {
+  const header = req.headers.authorization || '';
+  if (!header.startsWith('Basic ')) {
+    res.writeHead(401, {'WWW-Authenticate':'Basic realm="GEMHUB Admin"'});
+    res.end('Authentication required');
+    return false;
+  }
+  const decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
+  const i = decoded.indexOf(':');
+  const u = i >= 0 ? decoded.slice(0, i) : '';
+  const p = i >= 0 ? decoded.slice(i + 1) : '';
+  if (u !== ADMIN_USER || p !== ADMIN_PASSWORD) {
+    res.writeHead(401, {'WWW-Authenticate':'Basic realm="GEMHUB Admin"'});
+    res.end('Invalid credentials');
+    return false;
+  }
   return true;
 }
-function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function adminHtml(){
-  return `<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>پنل سفارشات جم هاب</title><style>body{margin:0;background:#f5f7fb;font-family:Tahoma,Arial;color:#172033}.wrap{width:min(1100px,94%);margin:30px auto}.head{display:flex;justify-content:space-between;align-items:center;gap:15px;margin-bottom:20px}.card{background:#fff;border:1px solid #e5eaf2;border-radius:18px;padding:18px;margin:12px 0;box-shadow:0 8px 25px #1a2b4a0a}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.muted{color:#718096;font-size:12px}.pill{display:inline-block;background:#eaf2ff;color:#1267e8;border-radius:999px;padding:6px 10px;font-size:11px;font-weight:bold}button{border:0;border-radius:10px;padding:9px 12px;background:#1769ff;color:#fff;font-family:inherit;cursor:pointer}select{padding:8px;border:1px solid #dfe5ee;border-radius:9px;font-family:inherit}@media(max-width:650px){.row{grid-template-columns:1fr}.head{align-items:flex-start;flex-direction:column}}</style></head><body><div class="wrap"><div class="head"><div><h1>📦 پنل سفارشات جم هاب</h1><div class="muted">سفارش‌های جدید مستقیماً اینجا ذخیره و نمایش داده می‌شوند.</div></div><button onclick="load()">↻ بروزرسانی</button></div><div id="list">در حال بارگذاری...</div></div><script>async function load(){let r=await fetch('/api/admin/orders');let d=await r.json();let el=document.querySelector('#list');if(!d.ok||!d.orders.length){el.innerHTML='<div class="card">هنوز سفارشی ثبت نشده است.</div>';return}el.innerHTML=d.orders.map(o=>\`<div class="card"><div class="row"><div><span class="pill">\${o.orderCode}</span><h3>\${o.items.map(i=>i.name+' × '+i.qty).join('، ')}</h3><div>Player ID: <b>\${o.playerId}</b></div><div>پلتفرم: \${o.platform||'—'}</div><div>شماره تماس: \${o.phone||'—'}</div></div><div><div><b>\${Number(o.total).toLocaleString('fa-IR')} تومان</b></div><div class="muted">\${new Date(o.createdAt).toLocaleString('fa-IR')}</div><br><label>وضعیت: <select onchange="status('\${o.orderCode}',this.value)"><option \${o.status==='new'?'selected':''} value="new">جدید</option><option \${o.status==='processing'?'selected':''} value="processing">در حال انجام</option><option \${o.status==='done'?'selected':''} value="done">انجام شد</option><option \${o.status==='cancelled'?'selected':''} value="cancelled">لغو شد</option></select></label></div></div></div>\`).join('')}async function status(code,s){await fetch('/api/admin/orders/'+encodeURIComponent(code),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:s})});load()}load();setInterval(load,15000)</script></body></html>`;
+
+function esc(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
 }
 
-const server=http.createServer(async(req,res)=>{
-  try{
-    const url=new URL(req.url,`http://${req.headers.host||'localhost'}`);
-    if(req.method==='GET'&&(url.pathname==='/'||url.pathname==='/gemhub.html')){res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});return fs.createReadStream(SITE).pipe(res)}
-    if(req.method==='POST'&&url.pathname==='/api/orders'){
-      const o=await parseBody(req);
-      if(!o.orderCode||!o.playerId||!Array.isArray(o.items)||!o.items.length)return json(res,400,{ok:false,error:'اطلاعات سفارش ناقص است'});
-      const orders=loadOrders();
-      o.status='new';o.statusLabel='جدید';o.createdAt=o.createdAt||new Date().toISOString();
-      orders.unshift(o);saveOrders(orders);
-      const itemText=o.items.map(i=>`${i.name} × ${i.qty}`).join('، ');
-      const msg=`🛒 <b>سفارش جدید جم هاب</b>\n\n🔢 کد سفارش: <b>${esc(o.orderCode)}</b>\n🎮 Player ID: <b>${esc(o.playerId)}</b>\n📱 پلتفرم: ${esc(o.platform||'—')}\n📞 شماره تماس: ${esc(o.phone||'—')}\n💎 محصولات: ${esc(itemText)}\n💰 مبلغ: <b>${Number(o.total).toLocaleString('fa-IR')} تومان</b>`;
-      sendTelegram(msg);
-      return json(res,200,{ok:true,orderCode:o.orderCode});
-    }
-    if(req.method==='GET'&&url.pathname.startsWith('/api/orders/')){
-      const code=decodeURIComponent(url.pathname.split('/').pop());const o=loadOrders().find(x=>x.orderCode===code);
-      return o?json(res,200,{ok:true,order:{orderCode:o.orderCode,total:o.total,status:o.status,statusLabel:{new:'جدید',processing:'در حال انجام',done:'انجام شد',cancelled:'لغو شد'}[o.status]||'جدید'}}):json(res,404,{ok:false});
-    }
-    if(url.pathname==='/admin'){
-      if(!auth(req,res))return;
-      res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'});return res.end(adminHtml());
-    }
-    if(url.pathname==='/api/admin/orders'){
-      if(!auth(req,res))return;return json(res,200,{ok:true,orders:loadOrders()});
-    }
-    if(req.method==='PATCH'&&url.pathname.startsWith('/api/admin/orders/')){
-      if(!auth(req,res))return;const code=decodeURIComponent(url.pathname.split('/').pop());const body=await parseBody(req);const orders=loadOrders();const o=orders.find(x=>x.orderCode===code);if(!o)return json(res,404,{ok:false});o.status=body.status;o.statusLabel={new:'جدید',processing:'در حال انجام',done:'انجام شد',cancelled:'لغو شد'}[body.status]||'جدید';saveOrders(orders);return json(res,200,{ok:true});
-    }
-    res.writeHead(404,{'Content-Type':'text/plain; charset=utf-8'});res.end('Not found');
-  }catch(e){console.error(e);json(res,500,{ok:false,error:'خطای داخلی سرور'})}
-});
-server.listen(PORT,()=>console.log(`Gem Hub running on http://localhost:${PORT}`));
+const encryptionSecret = process.env.ORDER_ENCRYPTION_KEY || ADMIN_PASSWORD;
+const key = crypto.createHash('sha256').update(String(encryptionSecret)).digest();
+
+function encrypt(value) {
+  if (value == null || value === '') return '';
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const enc = Buffer.concat([cipher.update(String(value), 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return [iv, tag, enc].map(b => b.toString('base64')).join('.');
+}
+
+function decrypt(value) {
+  if (!value) return '';
+  try {
+    const [ivB64, tagB64, dataB64] = String(value).split('.');
+    const decipher = crypto.createDecipheriv(
+      'aes-256-gcm',
+      key,
+      Buffer.from(ivB64, 'base64')
+    );
+    decipher.setAuthTag(Buffer.from(tagB64, 'base64'));
+    return Buffer.concat([
+      decipher.update(Buffer.from(dataB64, 'base64')),
+      decipher.final()
+    ]).toString('utf8');
+  } catch (_) {
+    return '';
+  }
+}
+
+function sanitizeOrderForPublic(order) {
+  if (!order) return null;
+  return {
+    orderCode: order.orderCode,
+    playerId: order.playerId,
+    phone: order.phone,
+    total: order.total,
+    subtotal: order.subtotal,
+    discount: order.discount,
+    couponCode: order.couponCode || '',
+    items: order.items || [],
+    orderType: order.orderType || '',
+    status: order.status || 'new',
+    statusReason: order.statusReason || '',
+    statusLabel: statusLabel(order.status),
+    createdAt: order.createdAt,
+    updatedAt: order.updatedAt
+  };
+}
+
+function statusLabel(status) {
+  return ({
+    new: 'جدید',
+    reviewed: 'در حال بررسی',
+    approved: 'تأیید شد',
+    processing: 'در حال انجام',
+    done: 'انجام شد',
+    cancelled: 'لغو شد'
+  })[status] || status || 'جدید';
+}
+
+function productList() {
+  return readJson(PRODUCTS_FILE, DEFAULT_PRODUCTS);
+}
+
+function validProductItems(items) {
+  const products = productList();
+  const map = new Map(products.map(p => [p.id, p]));
+  if (!Array.isArray(items) || !items.length) return null;
+  return items.map(item => {
+    const p = map.get(item.id);
+    if (!p || p.sold) return null;
+    const qty = Math.max(1, Math.min(100, Number(item.qty) || 1));
+    return {
+      id: p.id,
+      name: p.name,
+      qty,
+      price: Number(p.price) || 0,
+      type: p.type || ''
+    };
+  });
+}
+
+function calculateSubtotal(items) {
+  return items.reduce((sum, item) => sum + item.price * item.qty, 0);
+}
+
+function findCoupon(code) {
+  if (!code) return null;
+  const coupons = readJson(COUPONS_FILE, []);
+  return coupons.find(c =>
+    String(c.code || '').trim().toUpperCase() === String(code).trim().toUpperCase() &&
+    c.active !== false
+  ) || null;
+}
+
+function applyCoupon(coupon, subtotal) {
+  if (!coupon) return {discount: 0, total: subtotal};
+  const now = Date.now();
+  if (coupon.expiresAt && now > new Date(coupon.expiresAt).getTime()) {
+    return {discount: 0, total: subtotal};
+  }
+  if (coupon.minSubtotal && subtotal < Number(coupon.minSubtotal)) {
+    return {discount: 0, total: subtotal};
+  }
+  if (coupon.maxUses && Number(coupon.used || 0) >= Number(coupon.maxUses)) {
+    return {discount: 0, total: subtotal};
+  }
+  let discount = 0;
+  if (coupon.type === 'percent') discount = Math.floor(subtotal * Math.min(100, Math.max(0, Number(coupon.value) || 0)) / 100);
+  else discount = Math.max(0, Math.min(subtotal, Number(coupon.value) || 0));
+  return {discount, total: Math.max(0, subtotal - discount)};
+}
+
+function makeCode(prefix) {
+  return prefix + '-' + Math.random().toString(36).slice(2, 8).toUpperCase();
+}
